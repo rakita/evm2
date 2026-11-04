@@ -132,18 +132,31 @@ pub fn execute_prepared<T: EvmTypes, H: TxHandlerHooks<T>>(
     // instead and never runs out of gas: an execution refund for each already-existing authority,
     // and under EIP-8037 a state refund credited directly back to the reservoir so it stays state
     // gas — per execution-specs `set_delegation` (`state_gas_reservoir += refund`), deliberately
-    // not routed through execution gas first.
-    let (auth_oog, state_refund, execution_refund) = if req.host.feature(EvmFeatures::EIP2780) {
-        let mut auth_charges =
-            RuntimeAuthCharges::new(req.host.version(), &mut tx_gas, caller, tx.to, tx.value);
-        let oog = apply_auth_list(req.host, chain_id, &tx.authorization_list, &mut auth_charges)?;
-        (oog, 0, 0)
-    } else {
-        let mut auth_refunds = AuthRefunds::new(req.host.version());
-        apply_auth_list(req.host, chain_id, &tx.authorization_list, &mut auth_refunds)?;
-        let AuthRefunds { state_refund, execution_refund, .. } = auth_refunds;
-        tx_gas.set_reservoir(tx_gas.reservoir() + state_refund);
-        (false, state_refund, execution_refund)
+    // not routed through execution gas first. The intrinsic policy keeps hook-provided
+    // authorization costs without adding runtime charges or returning refunds.
+    let (auth_oog, state_refund, execution_refund) = match (
+        H::eip7702_auth_gas_policy(req.host, envelope),
+        req.host.feature(EvmFeatures::EIP2780),
+    ) {
+        (AuthGasPolicy::Intrinsic, _) => {
+            let oog =
+                apply_auth_list(req.host, chain_id, &tx.authorization_list, &mut IntrinsicAuth)?;
+            (oog, 0, 0)
+        }
+        (AuthGasPolicy::Ethereum, true) => {
+            let mut auth_charges =
+                RuntimeAuthCharges::new(req.host.version(), &mut tx_gas, caller, tx.to, tx.value);
+            let oog =
+                apply_auth_list(req.host, chain_id, &tx.authorization_list, &mut auth_charges)?;
+            (oog, 0, 0)
+        }
+        (AuthGasPolicy::Ethereum, false) => {
+            let mut auth_refunds = AuthRefunds::new(req.host.version());
+            apply_auth_list(req.host, chain_id, &tx.authorization_list, &mut auth_refunds)?;
+            let AuthRefunds { state_refund, execution_refund, .. } = auth_refunds;
+            tx_gas.set_reservoir(tx_gas.reservoir() + state_refund);
+            (false, state_refund, execution_refund)
+        }
     };
 
     // Applies the pre-Amsterdam authorization execution refund (zero under EIP-2780) and settles
@@ -511,6 +524,31 @@ impl Eip7702Authorization for LazyAuthorization {
 
     fn authority(&self) -> Option<Address> {
         Self::authority(self)
+    }
+}
+
+/// Authorization gas accounting selected by [`TxHandlerHooks::eip7702_auth_gas_policy`].
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum AuthGasPolicy {
+    /// Ethereum's fork-dependent runtime charges or intrinsic-cost refunds.
+    #[default]
+    Ethereum,
+    /// All authorization costs were charged intrinsically by the transaction handler.
+    ///
+    /// Authorizations are still validated and applied normally, but incur no further charges
+    /// or refunds, including for rejected entries. The handler must include their costs in
+    /// [`TxHandlerHooks::adjust_intrinsic_gas`]. Execution failure does not undo these costs.
+    Intrinsic,
+}
+
+/// Authorization costs are already paid and never refunded.
+struct IntrinsicAuth;
+
+impl AuthAccounting for IntrinsicAuth {
+    fn rejected(&mut self) {}
+
+    fn accepted(&mut self, _authority: Address, _auth: &AppliedAuth) -> Result<(), InstrStop> {
+        Ok(())
     }
 }
 
